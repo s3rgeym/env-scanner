@@ -593,7 +593,7 @@ func main() {
 	flag.StringVar(&inputFile, "input", "-", "File with base URLs (or - for stdin)")
 	flag.StringVar(&inputFile, "i", "-", "Input file (shorthand)")
 	flag.StringVar(&outputFile, "output", "-", "File for results (or - for stdout)")
-	flag.StringVar(&outputFile, "O", "-", "Output file (shorthand)")
+	flag.StringVar(&outputFile, "o", "-", "Output file (shorthand)")
 
 	flag.Parse()
 
