@@ -148,6 +148,9 @@ func randomUserAgent() string {
 
 var phpinfoTdRe = regexp.MustCompile(`<td class="e">(?P<name>.*?)</td><td class="v">(?P<value>.*?)</td>`)
 
+// envVarKeyRe validates shell/env variable names.
+var envVarKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 type Parser struct {
 	logger *Logger
 }
@@ -156,49 +159,83 @@ func NewParser(logger *Logger) *Parser {
 	return &Parser{logger: logger}
 }
 
-func (p *Parser) ParseEnv(body string) map[string]string {
+// unescapeString раскрывает escape-последовательности внутри двойных кавычек.
+// Возвращает ошибку, если после \ нет следующего символа.
+func unescapeString(s string) (string, error) {
+	if !strings.ContainsRune(s, '\\') {
+		return s, nil
+	}
+	var buf strings.Builder
+	buf.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' {
+			buf.WriteByte(s[i])
+			continue
+		}
+		i++
+		if i >= len(s) {
+			return "", fmt.Errorf("unexpected end of value after backslash")
+		}
+		switch s[i] {
+		case '\\':
+			buf.WriteByte('\\')
+		case '"':
+			buf.WriteByte('"')
+		case 'n':
+			buf.WriteByte('\n')
+		case 'r':
+			buf.WriteByte('\r')
+		case 't':
+			buf.WriteByte('\t')
+		default:
+			return "", fmt.Errorf("unknown escape sequence \\%c", s[i])
+		}
+	}
+	return buf.String(), nil
+}
+
+func (p *Parser) ParseEnv(body string) (map[string]string, error) {
 	vars := make(map[string]string)
-	scanner := bufio.NewScanner(strings.NewReader(body))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
-		idx := strings.Index(line, "=")
-		if idx < 0 {
-			continue
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid line: %q", line)
 		}
-		key := strings.TrimSpace(line[:idx])
-		val := strings.TrimSpace(line[idx+1:])
-		if key == "" {
-			continue
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if !envVarKeyRe.MatchString(key) {
+			return nil, fmt.Errorf("invalid key %q", key)
 		}
-		if len(val) >= 2 &&
-			((val[0] == '"' && val[len(val)-1] == '"') ||
-				(val[0] == '\'' && val[len(val)-1] == '\'')) {
-			val = val[1 : len(val)-1]
-		} else {
-			if i := strings.Index(val, " #"); i >= 0 {
-				val = strings.TrimSpace(val[:i])
+		if len(val) >= 2 && val[0] == val[len(val)-1] && (val[0] == '"' || val[0] == '\'') {
+			inner := val[1 : len(val)-1]
+			if val[0] == '"' {
+				var err error
+				inner, err = unescapeString(inner)
+				if err != nil {
+					return nil, fmt.Errorf("key %q: %w", key, err)
+				}
 			}
+			val = inner
 		}
 		vars[key] = val
 	}
-	return vars
+	return vars, nil
 }
 
-func (p *Parser) ParsePhpinfo(body, fullURL string) map[string]string {
+func (p *Parser) ParsePhpinfo(body, fullURL string) (map[string]string, error) {
 	p.logger.Debug("Parsing phpinfo.php response from %s", fullURL)
-	vars := make(map[string]string)
 
 	parts := strings.SplitN(body, "<h2>Environment</h2>", 2)
 	if len(parts) < 2 {
-		p.logger.Warn("Failed to parse phpinfo.php: %v", fmt.Errorf("Environment section not found"))
-		return vars
+		return nil, fmt.Errorf("Environment section not found in phpinfo output")
 	}
 	section := strings.SplitN(parts[1], "</table>", 2)[0]
 
+	vars := make(map[string]string)
 	for _, match := range phpinfoTdRe.FindAllStringSubmatch(section, -1) {
 		name := html.UnescapeString(strings.TrimSpace(match[1]))
 		value := html.UnescapeString(strings.TrimSpace(match[2]))
@@ -208,7 +245,7 @@ func (p *Parser) ParsePhpinfo(body, fullURL string) map[string]string {
 	}
 
 	p.logger.Debug("Extracted %d environment variables from phpinfo.php", len(vars))
-	return vars
+	return vars, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +295,9 @@ func (w *Worker) Run(ctx context.Context, tasks <-chan Task, results chan<- Resu
 			if err != nil {
 				continue
 			}
+			if len(result.EnvVars) == 0 {
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -304,11 +344,11 @@ func (w *Worker) process(ctx context.Context, task Task) (Result, error) {
 	}
 	defer resp.Body.Close()
 
-	w.logger.Info("Worker %d completed: %s - %d (%dms)", w.id, task.FullURL, resp.StatusCode, elapsed.Milliseconds())
-
 	if resp.StatusCode != http.StatusOK {
+		w.logger.Debug("Worker %d: %s - %d (%dms)", w.id, task.FullURL, resp.StatusCode, elapsed.Milliseconds())
 		return Result{}, fmt.Errorf("status %d", resp.StatusCode)
 	}
+	w.logger.Info("Worker %d: %s - 200 (%dms)", w.id, task.FullURL, elapsed.Milliseconds())
 
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
@@ -318,13 +358,29 @@ func (w *Worker) process(ctx context.Context, task Task) (Result, error) {
 	bodyStr := string(bodyBytes)
 
 	var envVars map[string]string
-	switch task.Path {
-	case ".env":
-		w.logger.Debug("Parsing .env response from %s", task.FullURL)
-		envVars = w.parser.ParseEnv(bodyStr)
-		w.logger.Debug("Extracted %d environment variables from .env", len(envVars))
-	case "phpinfo.php", "info.php":
-		envVars = w.parser.ParsePhpinfo(bodyStr, task.FullURL)
+	switch {
+	case strings.HasSuffix(task.Path, ".env") || strings.HasSuffix(task.Path, ".env.local"):
+		w.logger.Debug("Parsing env response from %s", task.FullURL)
+		var parseErr error
+		envVars, parseErr = w.parser.ParseEnv(bodyStr)
+		if parseErr != nil {
+			w.logger.Error("Worker %d: %s - parse error: %v", w.id, task.FullURL, parseErr)
+			return Result{}, parseErr
+		}
+		if len(envVars) == 0 {
+			w.logger.Warn("Worker %d: %s - no env vars found", w.id, task.FullURL)
+		}
+		w.logger.Debug("Extracted %d environment variables from %s", len(envVars), task.Path)
+	case task.Path == "phpinfo.php" || task.Path == "info.php":
+		var parseErr error
+		envVars, parseErr = w.parser.ParsePhpinfo(bodyStr, task.FullURL)
+		if parseErr != nil {
+			w.logger.Error("Worker %d: %s - parse error: %v", w.id, task.FullURL, parseErr)
+			return Result{}, parseErr
+		}
+		if len(envVars) == 0 {
+			w.logger.Warn("Worker %d: %s - no env vars found", w.id, task.FullURL)
+		}
 	default:
 		envVars = map[string]string{}
 	}
