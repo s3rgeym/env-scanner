@@ -1,0 +1,33 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Build
+      run: |
+        CGO_ENABLED=0 go build \
+          -ldflags="-s -w -extldflags=-static" \
+          -trimpath \
+          -o env-scanner \
+          main.go
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: env-scanner
+        generate_release_notes: true
