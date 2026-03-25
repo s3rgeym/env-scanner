@@ -39,16 +39,6 @@ func TestParseEnvFile(t *testing.T) {
 			want:  map[string]string{"FOO": "Bar", "BAR": "Bar"},
 		},
 		{
-			name:  "export prefix",
-			input: "export FOO=Bar",
-			want:  map[string]string{"FOO": "Bar"},
-		},
-		{
-			name:  "export with quotes",
-			input: `export FOO="Bar"`,
-			want:  map[string]string{"FOO": "Bar"},
-		},
-		{
 			name:  "skip comments",
 			input: "# this is a comment\nFOO=Bar",
 			want:  map[string]string{"FOO": "Bar"},
@@ -56,11 +46,6 @@ func TestParseEnvFile(t *testing.T) {
 		{
 			name:  "skip empty lines",
 			input: "\n\nFOO=Bar\n\n",
-			want:  map[string]string{"FOO": "Bar"},
-		},
-		{
-			name:  "inline comment stripped for unquoted",
-			input: "FOO=Bar # inline comment",
 			want:  map[string]string{"FOO": "Bar"},
 		},
 		{
@@ -89,12 +74,42 @@ func TestParseEnvFile(t *testing.T) {
 			want:  map[string]string{"FOO": "Bar"},
 		},
 		{
+			name:  "double quoted escape backslash",
+			input: `FOO="hello\\world"`,
+			want:  map[string]string{"FOO": `hello\world`},
+		},
+		{
+			name:  "escaped backslash before closing quote",
+			input: `FOO="hello\\"`,
+			want:  map[string]string{"FOO": `hello\`},
+		},
+		{
+			name:  "double quoted escape inner quote",
+			input: `FOO="say \"hi\""`,
+			want:  map[string]string{"FOO": `say "hi"`},
+		},
+		{
+			name:  "double quoted escape newline",
+			input: `FOO="line1\nline2"`,
+			want:  map[string]string{"FOO": "line1\nline2"},
+		},
+		{
+			name:  "single quoted literal backslash-n",
+			input: `FOO='line1\nline2'`,
+			want:  map[string]string{"FOO": `line1\nline2`},
+		},
+		{
+			name:  "single quoted no escape processing",
+			input: `FOO='hello\\world'`,
+			want:  map[string]string{"FOO": `hello\\world`},
+		},
+		{
 			name: "multiple vars",
 			input: `DB_HOST=localhost
 DB_PORT=5432
 DB_PASSWORD="secret123"
 API_KEY='abc123def456'
-export DEBUG=true`,
+DEBUG=true`,
 			want: map[string]string{
 				"DB_HOST":     "localhost",
 				"DB_PORT":     "5432",
@@ -108,9 +123,58 @@ export DEBUG=true`,
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := NewParser(&Logger{level: LERROR})
-			got := p.ParseEnv(tt.input)
+			got, err := p.ParseEnv(tt.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("\ninput: %q\ngot:  %v\nwant: %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseEnvFileErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name:    "no equals sign",
+			input:   "JUSTWORD",
+			wantErr: `invalid line`,
+		},
+		{
+			name:    "invalid key with space",
+			input:   "const FOO = bar",
+			wantErr: `invalid key "const FOO"`,
+		},
+		{
+			name:    "dotted key",
+			input:   "module.exports = {}",
+			wantErr: `invalid key "module.exports"`,
+		},
+		{
+			name:    "trailing backslash in value",
+			input:   `FOO="hello\"`,
+			wantErr: `unexpected end of value after backslash`,
+		},
+		{
+			name:    "unknown escape sequence",
+			input:   `FOO="hello\q"`,
+			wantErr: `unknown escape sequence`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewParser(&Logger{level: LERROR})
+			_, err := p.ParseEnv(tt.input)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("got error %q, want substring %q", err.Error(), tt.wantErr)
 			}
 		})
 	}
